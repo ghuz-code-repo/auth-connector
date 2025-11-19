@@ -81,8 +81,21 @@ class ServiceDiscoveryClient:
         signal.signal(signal.SIGINT, self._signal_handler)
     
     def _get_container_name(self) -> str:
-        """Get container name from hostname"""
-        return socket.gethostname()
+        """
+        Get container name from environment or hostname.
+        Priority:
+        1. CONTAINER_NAME env variable (set in docker-compose)
+        2. Hostname (fallback to short container ID)
+        """
+        import os
+        container_name = os.getenv('CONTAINER_NAME')
+        if container_name:
+            logger.debug(f"Using CONTAINER_NAME from env: {container_name}")
+            return container_name
+        
+        hostname = socket.gethostname()
+        logger.debug(f"Using hostname as container_name: {hostname}")
+        return hostname
     
     def _signal_handler(self, signum, frame):
         """Handle termination signals"""
@@ -90,44 +103,65 @@ class ServiceDiscoveryClient:
         self.deregister()
         sys.exit(0)
     
-    def register(self) -> bool:
+    def register(self, max_retries: int = 10, retry_delay: int = 3) -> bool:
         """
-        Register service with the registry
+        Register service with the registry with automatic retries
         
+        Args:
+            max_retries: Maximum number of registration attempts
+            retry_delay: Seconds to wait between retries
+            
         Returns:
             True if registration successful, False otherwise
         """
-        try:
-            payload = {
-                "service_key": self.service_key,
-                "container_name": self.container_name,
-                "internal_url": self.internal_url,
-                "health_check_path": self.health_check_path,
-                "metadata": self.metadata
-            }
-            
-            response = requests.post(
-                f"{self.registry_url}/register",
-                json=payload,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                self._registered = True
-                logger.info(
-                    f"✓ Service '{self.service_key}' registered successfully "
-                    f"(container: {self.container_name}, url: {self.internal_url})"
-                )
-                return True
-            else:
-                logger.error(
-                    f"✗ Failed to register service: {response.status_code} - {response.text}"
-                )
-                return False
+        for attempt in range(1, max_retries + 1):
+            try:
+                payload = {
+                    "service_key": self.service_key,
+                    "container_name": self.container_name,
+                    "internal_url": self.internal_url,
+                    "health_check_path": self.health_check_path,
+                    "metadata": self.metadata
+                }
                 
-        except Exception as e:
-            logger.error(f"✗ Exception during registration: {e}")
-            return False
+                response = requests.post(
+                    f"{self.registry_url}/register",
+                    json=payload,
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    self._registered = True
+                    logger.info(
+                        f"✓ Service '{self.service_key}' registered successfully "
+                        f"(container: {self.container_name}, url: {self.internal_url})"
+                    )
+                    return True
+                else:
+                    logger.warning(
+                        f"Registration attempt {attempt}/{max_retries} failed: "
+                        f"{response.status_code} - {response.text}"
+                    )
+                    
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(
+                    f"Registration attempt {attempt}/{max_retries} failed: "
+                    f"Cannot connect to registry (auth-service might not be ready yet)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Registration attempt {attempt}/{max_retries} failed: {e}"
+                )
+            
+            # Don't sleep after the last attempt
+            if attempt < max_retries:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+        
+        logger.error(
+            f"✗ Failed to register service '{self.service_key}' after {max_retries} attempts"
+        )
+        return False
     
     def deregister(self) -> bool:
         """
@@ -165,7 +199,8 @@ class ServiceDiscoveryClient:
     
     def send_heartbeat(self) -> bool:
         """
-        Send heartbeat signal to registry
+        Send heartbeat signal to registry.
+        If heartbeat fails with 404 (instance not found), attempt to re-register.
         
         Returns:
             True if heartbeat successful, False otherwise
@@ -185,12 +220,27 @@ class ServiceDiscoveryClient:
             if response.status_code == 200:
                 logger.debug(f"Heartbeat sent for '{self.service_key}'")
                 return True
+            elif response.status_code == 404:
+                # Instance not found - try to re-register
+                logger.warning(
+                    f"Heartbeat failed (404): Instance not found. Attempting to re-register..."
+                )
+                self._registered = False
+                if self.register(max_retries=3, retry_delay=2):
+                    logger.info("✓ Successfully re-registered after heartbeat failure")
+                    return True
+                else:
+                    logger.error("✗ Failed to re-register after heartbeat failure")
+                    return False
             else:
                 logger.warning(
                     f"Heartbeat failed: {response.status_code} - {response.text}"
                 )
                 return False
                 
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"Heartbeat failed: Cannot connect to registry")
+            return False
         except Exception as e:
             logger.warning(f"Heartbeat exception: {e}")
             return False
