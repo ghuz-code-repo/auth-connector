@@ -24,6 +24,7 @@ Usage:
     client.deregister()
 """
 
+import os
 import requests
 import threading
 import time
@@ -49,7 +50,8 @@ class ServiceDiscoveryClient:
         container_name: Optional[str] = None,
         health_check_path: str = "/health",
         heartbeat_interval: int = 30,
-        metadata: Optional[Dict[str, str]] = None
+        metadata: Optional[Dict[str, str]] = None,
+        api_key: Optional[str] = None
     ):
         """
         Initialize service discovery client
@@ -62,6 +64,7 @@ class ServiceDiscoveryClient:
             health_check_path: Path to health check endpoint
             heartbeat_interval: Seconds between heartbeat signals
             metadata: Additional service metadata
+            api_key: Internal API key for auth-service /api/* endpoints (X-API-Key header)
         """
         self.service_key = service_key
         self.internal_url = internal_url
@@ -70,6 +73,12 @@ class ServiceDiscoveryClient:
         self.health_check_path = health_check_path
         self.heartbeat_interval = heartbeat_interval
         self.metadata = metadata or {}
+        self._api_key = api_key or os.getenv('INTERNAL_API_KEY', '')
+        
+        # Session with default X-API-Key header
+        self._session = requests.Session()
+        if self._api_key:
+            self._session.headers['X-API-Key'] = self._api_key
         
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
@@ -87,7 +96,6 @@ class ServiceDiscoveryClient:
         1. CONTAINER_NAME env variable (set in docker-compose)
         2. Hostname (fallback to short container ID)
         """
-        import os
         container_name = os.getenv('CONTAINER_NAME')
         if container_name:
             logger.debug(f"Using CONTAINER_NAME from env: {container_name}")
@@ -124,7 +132,7 @@ class ServiceDiscoveryClient:
                     "metadata": self.metadata
                 }
                 
-                response = requests.post(
+                response = self._session.post(
                     f"{self.registry_url}/register",
                     json=payload,
                     timeout=10
@@ -177,7 +185,7 @@ class ServiceDiscoveryClient:
             # Stop heartbeat first
             self.stop_heartbeat()
             
-            response = requests.delete(
+            response = self._session.delete(
                 f"{self.registry_url}/unregister/{self.service_key}",
                 params={"container_name": self.container_name},
                 timeout=10
@@ -211,7 +219,7 @@ class ServiceDiscoveryClient:
                 "container_name": self.container_name
             }
             
-            response = requests.post(
+            response = self._session.post(
                 f"{self.registry_url}/heartbeat",
                 json=payload,
                 timeout=5

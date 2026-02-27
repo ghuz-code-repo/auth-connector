@@ -2,6 +2,7 @@
 Auth client for communicating with auth-service
 """
 
+import os
 import requests
 import json
 from typing import Dict, List, Optional, Any
@@ -15,15 +16,52 @@ logger = logging.getLogger(__name__)
 class AuthClient:
     """Client for auth-service communication"""
     
-    def __init__(self, auth_service_url: str, service_key: str, timeout: int = 10):
+    def __init__(self, auth_service_url: str, service_key: str, timeout: int = 10,
+                 api_key: str = None):
         self.auth_service_url = auth_service_url.rstrip('/')
         self.service_key = service_key
         self.timeout = timeout
+        self._api_key = api_key or os.getenv('INTERNAL_API_KEY', '')
         self._cache = {}
         self._cache_ttl = {}
+        
+        # Session with default X-API-Key header for all requests
+        self._session = requests.Session()
+        if self._api_key:
+            self._session.headers['X-API-Key'] = self._api_key
+    
+    @property
+    def api_headers(self) -> Dict[str, str]:
+        """Return headers dict with X-API-Key for use in direct requests.get() calls.
+        
+        Usage in services that make direct HTTP calls to auth-service /api/* endpoints:
+            response = requests.get(url, headers=auth_client.api_headers, timeout=5)
+        """
+        if self._api_key:
+            return {'X-API-Key': self._api_key}
+        return {}
     
     def get_user_permissions(self, user_id: str, force_refresh: bool = False) -> List[str]:
-        """Get user permissions for this service"""
+        """Get user permissions for this service.
+        
+        DEPRECATED: This method calls /api/users/{id}/permissions/{service_key}
+        which does not exist in auth-service. Permissions should be obtained from
+        nginx gateway headers (X-User-Service-Permissions) instead.
+        Kept for API compatibility — will log a warning if called.
+        """
+        import warnings
+        warnings.warn(
+            "AuthClient.get_user_permissions() is deprecated. "
+            "Use X-User-Service-Permissions header from nginx gateway instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        logger.warning(
+            "DEPRECATED: get_user_permissions() called for user=%s service=%s. "
+            "This endpoint does not exist in auth-service. "
+            "Use X-User-Service-Permissions header instead.",
+            user_id, self.service_key,
+        )
         cache_key = f"permissions:{user_id}"
         
         # Check cache first
@@ -32,7 +70,7 @@ class AuthClient:
         
         try:
             url = f"{self.auth_service_url}/api/users/{user_id}/permissions/{self.service_key}"
-            response = requests.get(url, timeout=self.timeout)
+            response = self._session.get(url, timeout=self.timeout)
             
             if response.status_code == 404:
                 return []  # User has no permissions for this service
@@ -58,7 +96,7 @@ class AuthClient:
             url = f"{self.auth_service_url}/api/users/{user_id}/documents"
             params = {"type": document_type} if document_type else {}
             
-            response = requests.get(url, params=params, timeout=self.timeout)
+            response = self._session.get(url, params=params, timeout=self.timeout)
             
             if response.status_code == 404:
                 return None
@@ -76,7 +114,7 @@ class AuthClient:
             url = f"{self.auth_service_url}/api/validate-token"
             headers = {"Authorization": f"Bearer {token}"}
             
-            response = requests.post(url, headers=headers, timeout=self.timeout)
+            response = self._session.post(url, headers=headers, timeout=self.timeout)
             
             if response.status_code == 401:
                 raise InvalidTokenError("Token is invalid or expired")
@@ -97,7 +135,7 @@ class AuthClient:
                 "permissions": permissions
             }
             
-            response = requests.post(url, json=payload, timeout=self.timeout)
+            response = self._session.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
             
             logger.info(f"Successfully synced {len(permissions)} permissions for service {self.service_key}")
@@ -111,7 +149,7 @@ class AuthClient:
         """Check if auth-service is available"""
         try:
             url = f"{self.auth_service_url}/health"
-            response = requests.get(url, timeout=self.timeout)
+            response = self._session.get(url, timeout=self.timeout)
             return response.status_code == 200
         except:
             return False

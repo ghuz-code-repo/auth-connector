@@ -31,16 +31,26 @@ class UserContext:
         self.raw_headers = raw_headers or {}
     
     def has_permission(self, permission: str) -> bool:
-        """Check if user has specific permission"""
-        return permission in self.permissions
+        """Check if user has specific permission.
+        Supports wildcard permissions: 'referal.*' matches 'referal.profile.view'.
+        """
+        if permission in self.permissions:
+            return True
+        # Check if any user permission is a wildcard that covers the requested one
+        for perm in self.permissions:
+            if perm.endswith('.*'):
+                prefix = perm[:-1]  # e.g. 'referal.*' -> 'referal.'
+                if permission.startswith(prefix):
+                    return True
+        return False
     
     def has_any_permission(self, permissions: List[str]) -> bool:
         """Check if user has any of the specified permissions"""
-        return any(perm in self.permissions for perm in permissions)
+        return any(self.has_permission(perm) for perm in permissions)
     
     def has_all_permissions(self, permissions: List[str]) -> bool:
         """Check if user has all specified permissions"""
-        return all(perm in self.permissions for perm in permissions)
+        return all(self.has_permission(perm) for perm in permissions)
     
     def has_role(self, role: str) -> bool:
         """Check if user has specific role"""
