@@ -84,8 +84,11 @@ class ServiceDiscoveryClient:
         self._stop_heartbeat = threading.Event()
         self._registered = False
         
-        # Register cleanup handlers
-        atexit.register(self.deregister)
+        # Register cleanup handlers — only stop heartbeat, do NOT deregister.
+        # Deregistration would trigger nginx config removal, causing 404 for
+        # all users during container restarts. The heartbeat timeout handles
+        # marking the instance as unhealthy automatically.
+        atexit.register(self.stop_heartbeat)
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
     
@@ -106,9 +109,15 @@ class ServiceDiscoveryClient:
         return hostname
     
     def _signal_handler(self, signum, frame):
-        """Handle termination signals"""
-        logger.info(f"Received signal {signum}, deregistering service...")
-        self.deregister()
+        """Handle termination signals.
+        
+        We intentionally do NOT deregister on shutdown. The auth-service
+        keeps the nginx route alive so that during restarts users see
+        a temporary 502 instead of a permanent 404. The heartbeat timeout
+        will mark the instance as unhealthy automatically.
+        """
+        logger.info(f"Received signal {signum}, stopping heartbeat (NOT deregistering)...")
+        self.stop_heartbeat()
         sys.exit(0)
     
     def register(self, max_retries: int = 10, retry_delay: int = 3) -> bool:
