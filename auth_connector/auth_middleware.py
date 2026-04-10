@@ -126,11 +126,9 @@ class AuthMiddleware:
     def _extract_from_jwt(self, token: str) -> UserContext:
         """Extract user context from JWT token"""
         try:
-            if self.verify_signature and self.jwt_secret:
-                payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
-            else:
-                # For development/internal use - decode without verification
-                payload = jwt.decode(token, options={"verify_signature": False})
+            if not self.jwt_secret:
+                raise InvalidTokenError("JWT secret not configured — cannot verify token")
+            payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
             
             return UserContext(
                 user_id=payload.get('user_id'),
