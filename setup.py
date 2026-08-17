@@ -2,7 +2,11 @@ from setuptools import setup, find_packages
 
 setup(
     name="auth-connector",
-    version="1.1.1",
+    # 2.0.0 — ломающее: UserContext лишился is_admin, декораторы потеряли
+    # allow_admin, добавлен модуль permission_utils. Должно совпадать с
+    # __version__ в auth_connector/__init__.py: по этой строке сервисы
+    # проверяют, что установлен пакет нужного поколения.
+    version="2.0.0",
     author="Analytics Team",
     description="Universal authentication and service discovery module for microservices",
     packages=find_packages(),
