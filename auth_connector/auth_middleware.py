@@ -12,42 +12,40 @@ import logging
 
 from .auth_client import AuthClient
 from .exceptions import PermissionDeniedError, InvalidTokenError, ConfigurationError
+from .permission_utils import any_permission_granted, permission_granted
 
 logger = logging.getLogger(__name__)
 
 
 class UserContext:
-    """User context extracted from auth headers"""
-    
-    def __init__(self, user_id: str, username: str, full_name: str = None, 
-                 roles: List[str] = None, permissions: List[str] = None, 
-                 is_admin: bool = False, raw_headers: Dict[str, str] = None):
+    """User context extracted from auth headers.
+
+    Признака администратора здесь нет намеренно. Шлюз больше не присылает
+    X-User-Admin: раньше по нему сервисы пускали запрос до сравнения прав, и
+    выданное роли в админке расходилось с тем, что реально действовало.
+    Администратор теперь носит обычное право '<service>.*'.
+    """
+
+    def __init__(self, user_id: str, username: str, full_name: str = None,
+                 roles: List[str] = None, permissions: List[str] = None,
+                 raw_headers: Dict[str, str] = None):
         self.user_id = user_id
         self.username = username
         self.full_name = full_name or username
         self.roles = roles or []
         self.permissions = permissions or []
-        self.is_admin = is_admin
         self.raw_headers = raw_headers or {}
     
     def has_permission(self, permission: str) -> bool:
         """Check if user has specific permission.
         Supports wildcard permissions: 'referal.*' matches 'referal.profile.view'.
         """
-        if permission in self.permissions:
-            return True
-        # Check if any user permission is a wildcard that covers the requested one
-        for perm in self.permissions:
-            if perm.endswith('.*'):
-                prefix = perm[:-1]  # e.g. 'referal.*' -> 'referal.'
-                if permission.startswith(prefix):
-                    return True
-        return False
-    
+        return permission_granted(permission, self.permissions)
+
     def has_any_permission(self, permissions: List[str]) -> bool:
         """Check if user has any of the specified permissions"""
-        return any(self.has_permission(perm) for perm in permissions)
-    
+        return any_permission_granted(permissions, self.permissions)
+
     def has_all_permissions(self, permissions: List[str]) -> bool:
         """Check if user has all specified permissions"""
         return all(self.has_permission(perm) for perm in permissions)
@@ -64,7 +62,6 @@ class UserContext:
             "full_name": self.full_name,
             "roles": self.roles,
             "permissions": self.permissions,
-            "is_admin": self.is_admin
         }
 
 
@@ -136,7 +133,6 @@ class AuthMiddleware:
                 full_name=payload.get('full_name'),
                 roles=payload.get('roles', []),
                 permissions=payload.get('permissions', []),
-                is_admin=payload.get('is_admin', False)
             )
         except jwt.InvalidTokenError as e:
             raise InvalidTokenError(f"Invalid JWT token: {e}")
@@ -161,16 +157,15 @@ class AuthMiddleware:
         
         roles = [r.strip() for r in roles_str.split(',') if r.strip()] if roles_str else []
         permissions = [p.strip() for p in permissions_str.split(',') if p.strip()] if permissions_str else []
-        
-        is_admin = headers.get('X-User-Admin', 'false').lower() == 'true'
-        
+
+        # X-User-Admin намеренно не читаем: шлюз его больше не шлёт, а права
+        # администратора приезжают обычным '<service>.*' в списке разрешений.
         return UserContext(
             user_id=user_id,
             username=username,
             full_name=full_name,
             roles=roles,
             permissions=permissions,
-            is_admin=is_admin,
             raw_headers=dict(headers)
         )
     
@@ -187,7 +182,6 @@ class AuthMiddleware:
                 full_name=data.get('full_name'),
                 roles=data.get('roles', []),
                 permissions=data.get('permissions', []),
-                is_admin=data.get('is_admin', False)
             )
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
             raise InvalidTokenError(f"Invalid internal token: {e}")
@@ -198,23 +192,25 @@ def get_current_user() -> Optional[UserContext]:
     return getattr(g, 'user', None)
 
 
-def require_permission(permission: str, allow_admin: bool = True):
-    """Decorator to require specific permission"""
+def require_permission(permission: str):
+    """Decorator to require specific permission.
+
+    Обхода по признаку администратора здесь нет: шлюз выдаёт админской роли
+    право '<service>.*', и оно проходит обычной проверкой шаблона. Отдельная
+    ветка 'если админ — пустить' раньше срабатывала до сравнения прав и
+    скрывала, что реально выдано роли.
+    """
     def decorator(f: Callable) -> Callable:
         @wraps(f)
         def decorated_function(*args, **kwargs):
             user = get_current_user()
-            
+
             if not user:
                 return jsonify({
                     "error": "Authentication required",
                     "code": "AUTH_REQUIRED"
                 }), 401
-            
-            # Admin bypass
-            if allow_admin and user.is_admin:
-                return f(*args, **kwargs)
-            
+
             # Check permission
             if not user.has_permission(permission):
                 return jsonify({
@@ -229,23 +225,19 @@ def require_permission(permission: str, allow_admin: bool = True):
     return decorator
 
 
-def require_any_permission(permissions: List[str], allow_admin: bool = True):
-    """Decorator to require any of the specified permissions"""
+def require_any_permission(permissions: List[str]):
+    """Decorator to require any of the specified permissions. См. require_permission."""
     def decorator(f: Callable) -> Callable:
         @wraps(f)
         def decorated_function(*args, **kwargs):
             user = get_current_user()
-            
+
             if not user:
                 return jsonify({
-                    "error": "Authentication required", 
+                    "error": "Authentication required",
                     "code": "AUTH_REQUIRED"
                 }), 401
-            
-            # Admin bypass
-            if allow_admin and user.is_admin:
-                return f(*args, **kwargs)
-            
+
             # Check permissions
             if not user.has_any_permission(permissions):
                 return jsonify({
@@ -260,23 +252,19 @@ def require_any_permission(permissions: List[str], allow_admin: bool = True):
     return decorator
 
 
-def require_role(role: str, allow_admin: bool = True):
-    """Decorator to require specific role (for backward compatibility)"""
+def require_role(role: str):
+    """Decorator to require specific role (for backward compatibility). См. require_permission."""
     def decorator(f: Callable) -> Callable:
         @wraps(f)
         def decorated_function(*args, **kwargs):
             user = get_current_user()
-            
+
             if not user:
                 return jsonify({
                     "error": "Authentication required",
                     "code": "AUTH_REQUIRED"
                 }), 401
-            
-            # Admin bypass
-            if allow_admin and user.is_admin:
-                return f(*args, **kwargs)
-            
+
             # Check role
             if not user.has_role(role):
                 return jsonify({
